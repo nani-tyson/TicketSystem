@@ -12,25 +12,34 @@ export const onTicketCreated = inngest.createFunction(
     try {
       const { ticketId } = event.data;
 
-      //fetch ticket from DB
-      const ticket = await step.run("fetch-ticket", async () => {
+      // Step 1: Fetch ticket from DB as plain object
+      const plainTicket = await step.run("fetch-ticket", async () => {
         const ticketObject = await Ticket.findById(ticketId);
-        if (!ticket) {
+        if (!ticketObject) {
           throw new NonRetriableError("Ticket not found");
         }
-        return ticketObject;
+        return ticketObject.toObject(); // ✅ .toObject moved inside
       });
 
+      // Step 2: Update status to TODO
       await step.run("update-ticket-status", async () => {
-        await Ticket.findByIdAndUpdate(ticket._id, { status: "TODO" });
+        await Ticket.findByIdAndUpdate(plainTicket._id, { status: "TODO" });
       });
 
-      const aiResponse = await analyzeTicket(ticket);
+      // Step 3: Analyze ticket using AI
+      const aiResponse = await analyzeTicket(plainTicket);
 
+      // Step 4: Validate AI response
+      if (!aiResponse || typeof aiResponse !== "object") {
+        console.error("⚠️ Invalid AI response:", aiResponse);
+        throw new NonRetriableError("AI response invalid");
+      }
+
+      // Step 5: AI Processing
       const relatedskills = await step.run("ai-processing", async () => {
         let skills = [];
         if (aiResponse) {
-          await Ticket.findByIdAndUpdate(ticket._id, {
+          await Ticket.findByIdAndUpdate(plainTicket._id, {
             priority: !["low", "medium", "high"].includes(aiResponse.priority)
               ? "medium"
               : aiResponse.priority,
@@ -38,40 +47,50 @@ export const onTicketCreated = inngest.createFunction(
             status: "IN_PROGRESS",
             relatedSkills: aiResponse.relatedSkills,
           });
-          skills = aiResponse.relatedSkills;
+          skills = Array.isArray(aiResponse.relatedSkills)
+            ? aiResponse.relatedSkills
+            : [];
         }
         return skills;
       });
 
+      // Step 6: Assign moderator
       const moderator = await step.run("assign-moderator", async () => {
-        let user = await User.findOne({
-          role: "moderator",
-          skills: {
-            $elemMatch: {
-              $regex: relatedskills.join("|"),
-              $options: "i",
-            },
-          },
-        });
-        if (!user) {
+        const skillsArray = Array.isArray(relatedskills)
+          ? relatedskills.filter(Boolean)
+          : [];
+
+        let user;
+        if (skillsArray.length > 0) {
           user = await User.findOne({
-            role: "admin",
+            role: "moderator",
+            skills: { $in: skillsArray }, // ✅ safer than $regex
           });
+        } else {
+          user = await User.findOne({ role: "moderator" });
         }
-        await Ticket.findByIdAndUpdate(ticket._id, {
+
+        if (!user) {
+          user = await User.findOne({ role: "admin" });
+        }
+
+        await Ticket.findByIdAndUpdate(plainTicket._id, {
           assignedTo: user?._id || null,
         });
+
         return user;
       });
 
-      await setp.run("send-email-notification", async () => {
-        if (moderator) {
-          const finalTicket = await Ticket.findById(ticket._id);
+      // Step 7: Send email notification
+      await step.run("send-email-notification", async () => {
+        if (moderator?.email) {
+          const finalTicket = await Ticket.findById(plainTicket._id);
           await sendMail(
             moderator.email,
             "Ticket Assigned",
-            `A new ticket is assigned to you ${finalTicket.title}`
+            `A new ticket is assigned to you: ${finalTicket.title}`
           );
+          console.log(`✅ Email sent to moderator ${moderator.email}`);
         }
       });
 
